@@ -1,0 +1,6 @@
+$ErrorActionPreference = "Stop"
+Write-Host "Executando INSERT, UPDATE e DELETE na tabela cdc_probe..."
+docker compose exec -T postgres psql -U postgres -d payments -v ON_ERROR_STOP=1 -c "INSERT INTO public.cdc_probe (id, message) VALUES (9001, 'insert feito pelo teste CDC');"
+docker compose exec -T postgres psql -U postgres -d payments -v ON_ERROR_STOP=1 -c "UPDATE public.cdc_probe SET message = 'update feito pelo teste CDC', updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') WHERE id = 9001;"
+docker compose exec -T postgres psql -U postgres -d payments -v ON_ERROR_STOP=1 -c "DELETE FROM public.cdc_probe WHERE id = 9001;"
+Write-Host "Operações executadas. Agora leia o tópico payments.public.cdc_probe. O DELETE deve ser representado por tombstone (valor null) após a transformação SMT."
