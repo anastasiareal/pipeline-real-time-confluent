@@ -1,0 +1,147 @@
+name: pipeline-pagamentos-local
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Crie o arquivo .env a partir de .env.example}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-payments}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: quay.io/debezium/kafka:3.7
+    restart: unless-stopped
+    environment:
+      CLUSTER_ID: "oh-sxaDRTcyAr6pFRbXyzA"
+      NODE_ID: 1
+      NODE_ROLE: combined
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/kafka/data
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.4.0
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "8081:8081"
+
+  connect:
+    image: quay.io/debezium/connect:3.7
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: payments-connect-cluster
+      CONFIG_STORAGE_TOPIC: payments-connect-configs
+      OFFSET_STORAGE_TOPIC: payments-connect-offsets
+      STATUS_STORAGE_TOPIC: payments-connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+    ports:
+      - "8083:8083"
+
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: flink/Dockerfile
+    image: pipeline-pagamentos-flink:2.2.1
+    restart: unless-stopped
+    command: jobmanager
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+        parallelism.default: 1
+        jobmanager.memory.process.size: 1024m
+        state.checkpoints.dir: file:///opt/flink/state/checkpoints
+        state.savepoints.dir: file:///opt/flink/state/savepoints
+    ports:
+      # Schema Registry ja usa a porta 8081 no host. Por isso a UI do Flink usa 8084.
+      - "8084:8081"
+    volumes:
+      - flink_state:/opt/flink/state
+
+  flink-taskmanager:
+    image: pipeline-pagamentos-flink:2.2.1
+    restart: unless-stopped
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.memory.process.size: 1024m
+    volumes:
+      - flink_state:/opt/flink/state
+
+  # Container de ferramentas: fica ocioso ate abrirmos o SQL Client manualmente.
+  flink-sql-client:
+    image: pipeline-pagamentos-flink:2.2.1
+    restart: unless-stopped
+    command: ["bash", "-lc", "sleep infinity"]
+    depends_on:
+      - flink-jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+    volumes:
+      - ./flink/sql:/opt/flink/sql:ro
+
+volumes:
+  postgres_data:
+  kafka_data:
+  flink_state:
